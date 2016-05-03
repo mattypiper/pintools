@@ -1,9 +1,9 @@
 # pintools
 A collection of PIN tools that I've created.
 
-Download PIN source from Intel's website appropriate for your platform.
-
-	https://software.intel.com/en-us/articles/pin-a-binary-instrumentation-tool-downloads
+Download PIN source from [Intel's
+website](https://software.intel.com/en-us/articles/pin-a-binary-instrumentation-tool-downloads). 
+Unzip to a directory that I'll call $PINDIR.
 
 # Building
 * copy to pin source tree:

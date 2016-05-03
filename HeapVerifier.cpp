@@ -1,6 +1,9 @@
 #include "pin.H"
 
+#include <sys/types.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <syscall.h>
 #include <memory>
 #include <iostream>
 #include <sstream>
@@ -30,19 +33,23 @@ pair<ADDRINT, ADDRINT> gMainImageAddress;
 
 struct RegionAttributes {
 	RegionAttributes(size_t s, int prot, string name = "") :
-		Size(s), Prot(prot), Name(name)
-	{}
+		Size(s), Prot(prot), Name(name) {}
 	size_t Size;
 	int Prot;
 	string Name;
 };
 typedef shared_ptr<RegionAttributes> RegionAttributesPtr;
+typedef pair<ADDRINT, RegionAttributesPtr> MapPair;
 typedef unordered_map<ADDRINT, RegionAttributesPtr> MemoryMap;
 typedef MemoryMap::iterator MapIter;
 typedef unordered_map<ADDRINT, string> StringMap;
 typedef StringMap::const_iterator StringMapCIter;
+typedef unordered_map<pid_t, MapPair> ThreadedMemoryMap;
+typedef ThreadedMemoryMap::iterator ThreadedMemoryMapIter;
+typedef pair<pid_t, MapPair> ThreadedMapPair;
 
 MemoryMap gImageMap;
+ThreadedMemoryMap gStackMap;
 MemoryMap gHeapMap;
 MemoryMap gFreeMap;
 
@@ -55,10 +62,34 @@ StringMap gInstructions;
 // Used in before/after callbacks to track heap allocs
 // TODO this doesn't work for multiple threads... convert to map<threadid,pair<addr,size>>
 size_t gAllocSize = 0;
-ADDRINT gRetAddress = 0;
+ADDRINT gMallocRetAddr = 0;
 ADDRINT gMallocUsableAddress = 0;
 ADDRINT gMallocUsableRet = 0;
 int gAllocProt = 0;
+
+// TODO move to utility file
+const char COLOR_RED[] = "\033[1;31m";
+const char COLOR_YELLOW[] = "\033[1;33m";
+const char COLOR_LIGHT_CYAN[] = "\033[1;36m";
+const char COLOR_RESET[] = "\033[0m";
+void hexdump(ostringstream& ss, const char *p, size_t len)
+{
+	size_t r, c;
+	ss << hex;
+	ss << "+==== 0x" << p << " ====+" << endl;
+	for (r = 0; r < len/8; ++r) {
+		ss << "| ";
+		for (c = 0; c < 8; ++c) {
+			ss << (unsigned char)p[r*8+c];
+			if (c == 3) ss << " ";
+		} ss << " |" << endl;
+	}
+}
+
+pid_t gettid (void)
+{
+	return syscall(__NR_gettid);
+}
 
 /* Check if address belongs to main executable */
 bool isMain(ADDRINT ret)
@@ -81,9 +112,23 @@ bool IsAddressInMap(MemoryMap map, ADDRINT addr)
 	return false;
 }
 
+bool IsStackMemory(MapPair stackMap, ADDRINT testaddr)
+{
+	ADDRINT top = stackMap.first;
+	ADDRINT bottom = top + stackMap.second->Size;
+	if (testaddr < top && testaddr > bottom) return true;
+	else return false;
+}
+
 /* check if an address is part of allocated chunk  */
 bool IsAllocatedAddress(ADDRINT addr)
 {
+	pid_t tid = gettid();
+	ThreadedMemoryMapIter tmmi = gStackMap.find(tid);
+	if (tmmi != gStackMap.end()) {
+		if (IsStackMemory(tmmi->second, addr))
+			return true;
+	}
 	return IsAddressInMap(gImageMap, addr) || IsAddressInMap(gHeapMap, addr);
 }
 
@@ -95,37 +140,34 @@ bool IsFreedAddress(ADDRINT addr)
 /* for malloc, sbrk, realloc allocations */
 void AllocBefore(string* name, size_t size, ADDRINT ret)
 {
-	if (isMain(ret)) {
-		gRetAddress = ret;
-		gAllocSize = size;
-		gAllocProt = PROT_READ | PROT_WRITE;
-		// TraceFile << (ret-5) << "@" << *name << "[" << allocsize << "]" << endl;
-	}
+	// cout << "malloc: " << name << " 0x" << hex << size << " 0x" << ret << endl;
+	gMallocRetAddr = ret;
+	gAllocSize = size;
+	gAllocProt = PROT_READ | PROT_WRITE;
+	// TraceFile << (ret-5) << "@" << *name << "[" << size << "]" << endl;
 	// TODO this crashes? delete name;
 }
 
 /* for mmap allocations */
 void MmapBefore(string* name, size_t size, int prot, ADDRINT ret)
 {
-	if (isMain(ret)) {
-		gRetAddress = ret;
-		gAllocSize = size;
-		gAllocProt = prot;
-		// TraceFile << (ret-5) << "@" << *name << "[" << allocsize << "]" << endl;
-	}
-	// TODO this crashes? delete name;
+	// cout << "mmap: " << name << " 0x" << hex << size << " 0x" << ret << endl;
+	gMallocRetAddr = ret;
+	gAllocSize = size;
+	gAllocProt = prot;
+	// TraceFile << (ret-5) << "@" << *name << "[" << size << "]" << endl;
+	// TODO delete name crashes?
 }
 
 /* for calloc allocation */
 void CallocBefore(string* name, size_t nmemb, size_t size, ADDRINT ret)
 {
-	if (isMain(ret)) {
-		gRetAddress = ret;
-		gAllocSize = nmemb * size;
-		gAllocProt = PROT_READ | PROT_WRITE;
-		// TraceFile << (ret-5) << "@" << *name << "[" << allocsize << "]" << endl;
-	}
-	// TODO this crashes? delete name;
+	// cout << "calloc: " << name << " 0x" << hex << size << " 0x" << ret << endl;
+	gMallocRetAddr = ret;
+	gAllocSize = nmemb * size;
+	gAllocProt = PROT_READ | PROT_WRITE;
+	// TraceFile << (ret-5) << "@" << *name << "[" << nmemb*size << "]" << endl;
+	// TODO delete name crashes?
 }
 
 void MallocUsableBefore(string* name, ADDRINT pointer, ADDRINT ret)
@@ -140,6 +182,7 @@ void MallocUsableBefore(string* name, ADDRINT pointer, ADDRINT ret)
 // chunk data is available and write to the chunk legally (eg plaiddb)
 void MallocUsableAfter(size_t size)
 {
+	// cout << "malloc usable: " << size << endl;
 	if (size == 0)
 		return;
 
@@ -157,8 +200,12 @@ void AllocAfter(ADDRINT newalloc)
 {
 	if (!newalloc)
 		return;
-	
-	// TraceFile << "Allocation @ " << newalloc << ", size " << gAllocSize << endl;
+	ostringstream oss;
+	oss << hex << setfill('0');
+	oss << "Allocation @ 0x" << setw(8) << newalloc << ", size 0x" << gAllocSize << endl;
+	TraceFile << oss.str();
+	// cout << oss.str();
+
 	{
 		lock_guard<mutex> lk(gHeapMutex);
 		MapIter it = gHeapMap.find(newalloc);
@@ -217,11 +264,7 @@ bool INS_has_sp(INS ins)
 {
 	for (unsigned int i = 0; i < INS_OperandCount(ins); i++) {
 		REG op = INS_OperandMemoryBaseReg(ins, i);
-#ifdef __i386__ 
-		if ((op == REG_ESP) || (op == REG_EBP))  return true;
-#else
-		if ((op == REG_RSP) || (op == REG_RBP))  return true;
-#endif
+		if ((op == REG_STACK_PTR) || (op == REG_GBP)) return true;
 	}
 	return false;
 }
@@ -350,31 +393,28 @@ void Image(IMG img, void *v)
 	RtnInsertCall(img, MALLOC_USABLE_SIZE);
 }
 
-const char redTerm[] = "\033[1;31m";
-const char resetTerm[] = "\033[0m";
-
 // This function logs writes to allocated areas.
 // @arg type "WRREG" or "WRIMM"
 void write_instruction(ADDRINT address, ADDRINT write_address, ADDRINT regval, char *type)
 {
 	StringMapCIter it = gInstructions.find(address);
 	if (it == gInstructions.end()) assert(0);
-	ADDRINT offset = address - gMainImageAddress.first;
+	//ADDRINT offset = address - gMainImageAddress.first;
 	ostringstream oss;
 	oss << hex;
 
 	if (IsFreedAddress(write_address)) {
 		oss << "[!] Write to free address: 0x";
-		oss << left << setw(12) << offset << "@" << setw(40)  << it->second;
-		oss << "   : " << type << " MEM[" << write_address << "] VAL[" << regval << "]" << endl;
+		oss << left << setw(6) << address << setw(36)  << it->second;
+		oss << type << " MEM[0x" << setfill('0') << setw(8) << write_address << "] VAL[0x" << regval << "]" << endl;
 		TraceFile << oss.str();
-		cerr << redTerm << oss.str() << resetTerm;
+		cerr << COLOR_RED << oss.str() << COLOR_RESET;
 	} else if (!IsAllocatedAddress(write_address)) {
 		oss << "[!] Write OOB: 0x";	
-		oss << left << setw(12) << offset << "@" << setw(40)  << it->second;
-		oss << "   : " << type << " MEM[" << write_address << "] VAL[" << regval << "]" << endl;
+		oss << left << setw(6) << address << setw(36)  << it->second;
+		oss << type << " MEM[0x" << setfill('0') << setw(8) << write_address << "] VAL[0x" << regval << "]" << endl;
 		TraceFile << oss.str();
-		cerr << redTerm << oss.str() << resetTerm;
+		cerr << COLOR_RED << oss.str() << COLOR_RESET;
 	}
 }
 
@@ -384,7 +424,7 @@ void read_instruction(ADDRINT address, ADDRINT read_address, ADDRINT size)
 	StringMapCIter it = gInstructions.find(address);
 	if (it == gInstructions.end()) assert(0);
 
-	ADDRINT offset = address - gMainImageAddress.first;
+	//ADDRINT offset = address - gMainImageAddress.first;
 	ADDRINT value = 0;
 	if ((size == 8) || (size == 4)) {
 		value = *(ADDRINT *)read_address;
@@ -393,48 +433,102 @@ void read_instruction(ADDRINT address, ADDRINT read_address, ADDRINT size)
 	}
 
 	if (IsFreedAddress(read_address)) {
-		oss << "[!] Read from free address: 0x";
-		oss << left << setw(12) << offset << "@" << setw(40)  << it->second;
-		oss << "   : MREAD VAL[" << value << "] MEM[" << read_address << "]" << endl;
+		oss << "[!] Read free: 0x";
+		oss << left << setw(6) << address << " " << setw(36)  << it->second;
+		oss << "MREAD VAL[0x" << value << "] MEM[0x" << hex << setfill('0') << setw(8) << read_address << "]" << endl;
 		TraceFile << oss.str();
-		cerr << redTerm << oss.str() << resetTerm;
+		cerr << COLOR_YELLOW << oss.str() << COLOR_RESET;
 	} else if (!IsAllocatedAddress(read_address)) {
 		oss << "[!] Read OOB: 0x";
-		oss << left << setw(12) << offset << "@" << setw(40)  << it->second;
-		oss << "   : MREAD VAL[" << value << "] MEM[" << read_address << "]" << endl;
+		oss << left << setw(6) << address << " " << setw(36)  << it->second;
+		oss << "MREAD VAL[0x" << value << "] VAL[0x" << hex << setfill('0') << setw(8) << read_address << "]" << endl;
 		TraceFile << oss.str();
-		cerr << redTerm << oss.str() << resetTerm;
+		cerr << COLOR_YELLOW << oss.str() << COLOR_RESET;
+		oss.clear();
+		hexdump(oss, (const char*)read_address, 32);
 	}
+}
+
+void stackptr_instruction(ADDRINT addr, ADDRINT sp, string *mnemonic)
+{
+	static ADDRINT lowestSp = (ADDRINT)-1;
+	if (sp < lowestSp) lowestSp = sp;
+	ostringstream oss;
+	oss << hex;
+	oss << "SP changed: " << left << setw(8) << addr << ", " << *mnemonic
+		<< "$SP=" << (void*)sp << ", " << (void*)lowestSp << endl;
+	TraceFile << oss;
+}
+
+void update_stack(pid_t thread_id, ADDRINT sp, INT offset)
+{
+	pid_t tid = gettid();
+	ThreadedMemoryMapIter tmmi = gStackMap.find(tid);
+	ostringstream oss; oss << thread_id << "-stack";
+	string stack_name; stack_name = oss.str();
+	if (tmmi == gStackMap.end()) {
+		// cout << "Initialized new stack with SP at " << hex << "0x" << sp << endl;
+		RegionAttributesPtr rap = RegionAttributesPtr(new RegionAttributes(sp + offset, 6, stack_name));
+		pair<pid_t, MemoryMap> tp(thread_id, { MapPair(sp, rap) } );
+		gStackMap.insert(ThreadedMapPair(thread_id, MapPair(sp, rap)));
+	} else {
+		ADDRINT orig_sp = tmmi->second.first;
+		//cout << hex << "Updating sp 0x" << orig_sp << " to 0x" << sp << endl;
+		RegionAttributesPtr rap = RegionAttributesPtr(new RegionAttributes(orig_sp - sp + offset, 6, stack_name));
+		tmmi->second = MapPair(orig_sp, rap);
+	}
+}
+
+void stackptr_add(ADDRINT address, ADDRINT sp, ADDRINT operand, string *mnemonic)
+{
+#if 0
+	ostringstream oss;
+	oss << hex << COLOR_LIGHT_CYAN;
+	oss << "stackptr_add (" << gettid() << "): " << left << "PC=0x" << setw(8) << address <<
+		" SP=0x" << sp << ": " << *mnemonic << COLOR_RESET << endl;
+	cout << oss.str();
+	TraceFile << oss;
+#endif
+	update_stack(gettid(), sp, operand);
+}
+
+void stackptr_sub(ADDRINT address, ADDRINT sp, ADDRINT operand, string *mnemonic)
+{
+#if 0
+	ostringstream oss;
+	oss << hex << COLOR_LIGHT_CYAN;
+	oss << "stackptr_sub (" << gettid() << "): " << left << "PC=0x" << setw(8) << address <<
+		" SP=0x" << sp << ": " << *mnemonic << COLOR_RESET << endl;
+	cout << oss.str();
+	TraceFile << oss.str();
+#endif
+	update_stack(gettid(), sp, operand);
 }
 
 void TraceInstruction(INS ins, void *v)
 {
 	ADDRINT insaddr = INS_Address(ins);
-	
-	if (insaddr == gRetAddress) {
+
+	// instrument malloc calls
+	if (insaddr == gMallocRetAddr) {
 		INS_InsertCall(ins,
 			IPOINT_BEFORE,
 			(AFUNPTR)AllocAfter,
-#ifdef __i386__ 
-			IARG_REG_VALUE, LEVEL_BASE::REG_EAX,
-#else
-			IARG_REG_VALUE, LEVEL_BASE::REG_RAX,
-#endif
+			IARG_REG_VALUE, REG_GAX,
 			IARG_END
 		);
 	} else if (insaddr == gMallocUsableRet) {
 		INS_InsertCall(ins,
 			IPOINT_BEFORE,
 			(AFUNPTR)MallocUsableAfter,
-#ifdef __i386__ 
-			IARG_REG_VALUE, LEVEL_BASE::REG_EAX,
-#else
-			IARG_REG_VALUE, LEVEL_BASE::REG_RAX,
-#endif
+			IARG_REG_VALUE, REG_GAX,
 			IARG_END
 		);
 	}
 
+	// instrument memory accesses that use mov
+	// TODO support other memory accesses (push, pop, [deref] math, lea)
+	// TODO support code outside of primary image text
 	if (isMain(insaddr) &&
 		(INS_Opcode(ins) == XED_ICLASS_MOV) &&
 		(INS_has_sp(ins) == false) &&
@@ -446,7 +540,7 @@ void TraceInstruction(INS ins, void *v)
 		}
 	
 		if (INS_IsMemoryWrite(ins)) {
-			if(INS_OperandIsReg(ins, 1)) {
+			if (INS_OperandIsReg(ins, 1)) {
 				REG src = INS_OperandReg(ins, 1);
 				if (REG_valid(src)) {	
 					INS_InsertCall(
@@ -456,11 +550,11 @@ void TraceInstruction(INS ins, void *v)
 						IARG_ADDRINT, insaddr,
 						IARG_MEMORYWRITE_EA,   	// target address of memory write
 						IARG_REG_VALUE, src, 	// register value to be written
-						IARG_PTR , "WRREG",
+						IARG_PTR, "WRREG",
 						IARG_END
 					);
 	        	}
-			} else if(INS_OperandIsImmediate(ins, 1)) {
+			} else if (INS_OperandIsImmediate(ins, 1)) {
 				ADDRINT src = (ADDRINT)INS_OperandImmediate(ins, 1);
 				INS_InsertCall(
 					ins,
@@ -473,7 +567,7 @@ void TraceInstruction(INS ins, void *v)
 					IARG_END
 				);
 			}
-		} else if(INS_IsMemoryRead(ins)) {
+		} else if (INS_IsMemoryRead(ins)) {
 			INS_InsertCall(
 				ins,
 				IPOINT_BEFORE,
@@ -484,6 +578,34 @@ void TraceInstruction(INS ins, void *v)
 				IARG_END);
 		}
 	}
+
+	// instrument stack ptr adjustments using add/sub
+	if (INS_Opcode(ins) == XED_ICLASS_SUB &&
+		INS_OperandReg(ins, 0) == REG_STACK_PTR &&
+		INS_OperandIsImmediate(ins, 1)) {
+		INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)stackptr_sub,
+			IARG_ADDRINT, insaddr,
+			IARG_REG_VALUE, REG_STACK_PTR,
+			IARG_ADDRINT, (UINT32)INS_OperandImmediate(ins, 1),
+			IARG_ADDRINT, new string(INS_Disassemble(ins)), IARG_END);
+	} else if (INS_Opcode(ins) == XED_ICLASS_ADD &&
+		INS_OperandReg(ins, 0) == REG_STACK_PTR &&
+		INS_OperandIsImmediate(ins, 1)) {
+		INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)stackptr_add,
+			IARG_ADDRINT, insaddr,
+			IARG_REG_VALUE, REG_STACK_PTR,
+			IARG_ADDRINT, (UINT32)INS_OperandImmediate(ins, 1),
+			IARG_ADDRINT, new string(INS_Disassemble(ins)), IARG_END);
+	}
+#if 0
+	// other stack ptr modifications?
+	if (INS_RegWContain(ins, REG_STACK_PTR)) {
+		INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)stackptr_instruction,
+			IARG_ADDRINT, insaddr,
+			IARG_ADDRINT, new string(INS_Mnemonic(ins)),
+			IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
+	}
+#endif
 }
 
 void Fini(INT32 code, void *v)
@@ -494,11 +616,10 @@ void Fini(INT32 code, void *v)
 int main(int argc, char **argv)
 {
 	PIN_InitSymbols();
-	if(PIN_Init(argc,argv)) return -1;
+	if (PIN_Init(argc,argv)) return -1;
 
 	// tracefile for PIN    
 	TraceFile.open(KnobOutputFile.Value().c_str());
-
 	TraceFile << hex;
 	TraceFile.setf(ios::showbase);
 
