@@ -9,6 +9,7 @@
 #include <sstream>
 #include <fstream>
 #include <unordered_map>
+#include <set>
 #include <mutex>
 #include <iomanip>
 #include <cassert>
@@ -48,24 +49,33 @@ typedef unordered_map<pid_t, MapPair> ThreadedMemoryMap;
 typedef ThreadedMemoryMap::iterator ThreadedMemoryMapIter;
 typedef pair<pid_t, MapPair> ThreadedMapPair;
 
-MemoryMap gImageMap;
 ThreadedMemoryMap gStackMap;
+MemoryMap gImageMap;
 MemoryMap gHeapMap;
 MemoryMap gFreeMap;
 
+mutex gImageMutex;
+mutex gStackMutex;
 mutex gHeapMutex;
 mutex gFreeMutex;
-mutex gImageMutex;
 
 StringMap gInstructions;
 
 // Used in before/after callbacks to track heap allocs
-// TODO this doesn't work for multiple threads... convert to map<threadid,pair<addr,size>>
-size_t gAllocSize = 0;
-ADDRINT gMallocRetAddr = 0;
-ADDRINT gMallocUsableAddress = 0;
-ADDRINT gMallocUsableRet = 0;
-int gAllocProt = 0;
+struct AllocParams {
+	size_t size;
+	ADDRINT ret;
+	ADDRINT usableAddr;
+	ADDRINT usableRet;
+	int prot;
+};
+typedef shared_ptr<AllocParams> AllocParamsPtr;
+AllocParamsPtr x;
+typedef pair<pid_t, AllocParamsPtr> ThreadedAllocParams;
+typedef unordered_map<pid_t, AllocParamsPtr> ThreadedAllocMap;
+typedef ThreadedAllocMap::iterator TAPIter;
+ThreadedAllocMap gAllocParams;
+mutex gAllocMutex;
 
 // TODO move to utility file
 const char COLOR_RED[] = "\033[1;31m";
@@ -114,8 +124,12 @@ bool IsAddressInMap(MemoryMap map, ADDRINT addr)
 
 bool IsStackMemory(MapPair stackMap, ADDRINT testaddr)
 {
-	ADDRINT top = stackMap.first;
-	ADDRINT bottom = top + stackMap.second->Size;
+	ADDRINT top, bottom;
+	{
+		lock_guard<mutex> lk(gStackMutex);
+		top = stackMap.first;
+		bottom = top + stackMap.second->Size;
+	}
 	if (testaddr < top && testaddr > bottom) return true;
 	else return false;
 }
@@ -123,11 +137,14 @@ bool IsStackMemory(MapPair stackMap, ADDRINT testaddr)
 /* check if an address is part of allocated chunk  */
 bool IsAllocatedAddress(ADDRINT addr)
 {
+	ThreadedMemoryMapIter tmmi;
 	pid_t tid = gettid();
-	ThreadedMemoryMapIter tmmi = gStackMap.find(tid);
-	if (tmmi != gStackMap.end()) {
-		if (IsStackMemory(tmmi->second, addr))
-			return true;
+	{
+		lock_guard<mutex> lk(gStackMutex);
+		tmmi = gStackMap.find(tid);
+	}
+	if ((tmmi != gStackMap.end()) && (IsStackMemory(tmmi->second, addr))) {
+		return true;
 	}
 	return IsAddressInMap(gImageMap, addr) || IsAddressInMap(gHeapMap, addr);
 }
@@ -141,21 +158,40 @@ bool IsFreedAddress(ADDRINT addr)
 void AllocBefore(string* name, size_t size, ADDRINT ret)
 {
 	// cout << "malloc: " << name << " 0x" << hex << size << " 0x" << ret << endl;
-	gMallocRetAddr = ret;
-	gAllocSize = size;
-	gAllocProt = PROT_READ | PROT_WRITE;
-	// TraceFile << (ret-5) << "@" << *name << "[" << size << "]" << endl;
-	// TODO this crashes? delete name;
+	lock_guard<mutex> lk(gAllocMutex);
+	TAPIter it = gAllocParams.find(gettid());
+	if (it != gAllocParams.end()) {
+		AllocParamsPtr p = it->second;
+		p->size = size;
+		p->ret = ret;
+		p->prot = PROT_READ|PROT_WRITE;	
+	} else {
+		gAllocParams.insert(ThreadedAllocParams(
+			gettid(), 
+			AllocParamsPtr(new AllocParams{size, ret, 0, 0, PROT_READ|PROT_WRITE})
+		));
+	}
+	// TODO delete name crashes?
 }
 
 /* for mmap allocations */
 void MmapBefore(string* name, size_t size, int prot, ADDRINT ret)
 {
 	// cout << "mmap: " << name << " 0x" << hex << size << " 0x" << ret << endl;
-	gMallocRetAddr = ret;
-	gAllocSize = size;
-	gAllocProt = prot;
 	// TraceFile << (ret-5) << "@" << *name << "[" << size << "]" << endl;
+	lock_guard<mutex> lk(gAllocMutex);
+	TAPIter it = gAllocParams.find(gettid());
+	if (it != gAllocParams.end()) {
+		AllocParamsPtr p = it->second;
+		p->size = size;
+		p->ret = ret;
+		p->prot = PROT_READ|PROT_WRITE;	
+	} else {
+		gAllocParams.insert(ThreadedAllocParams(
+			gettid(), 
+			AllocParamsPtr(new AllocParams{size, ret, 0, 0, prot})
+		));
+	}
 	// TODO delete name crashes?
 }
 
@@ -163,18 +199,38 @@ void MmapBefore(string* name, size_t size, int prot, ADDRINT ret)
 void CallocBefore(string* name, size_t nmemb, size_t size, ADDRINT ret)
 {
 	// cout << "calloc: " << name << " 0x" << hex << size << " 0x" << ret << endl;
-	gMallocRetAddr = ret;
-	gAllocSize = nmemb * size;
-	gAllocProt = PROT_READ | PROT_WRITE;
+	lock_guard<mutex> lk(gAllocMutex);
+	TAPIter it = gAllocParams.find(gettid());
+	if (it != gAllocParams.end()) {
+		AllocParamsPtr p = it->second;
+		p->size = nmemb * size;
+		p->ret = ret;
+		p->prot = PROT_READ|PROT_WRITE;	
+	} else {
+		gAllocParams.insert(ThreadedAllocParams(
+			gettid(), 
+			AllocParamsPtr(new AllocParams{size, ret, 0, 0, PROT_READ|PROT_WRITE})
+		));
+	}
 	// TraceFile << (ret-5) << "@" << *name << "[" << nmemb*size << "]" << endl;
 	// TODO delete name crashes?
 }
 
 void MallocUsableBefore(string* name, ADDRINT pointer, ADDRINT ret)
 {
-	if (isMain(ret)) {
-		gMallocUsableAddress = pointer;
-		gMallocUsableRet = ret;
+	if (!isMain(ret)) return;
+	lock_guard<mutex> lk(gAllocMutex);
+	TAPIter it = gAllocParams.find(gettid());
+	if (it != gAllocParams.end()) {
+		AllocParamsPtr p = it->second;
+		p->usableAddr = pointer;
+		p->usableRet = ret;
+	} else {
+		gAllocParams.insert(ThreadedAllocParams(
+			gettid(), 
+			AllocParamsPtr(new AllocParams{0, 0, pointer, ret,
+				PROT_READ|PROT_WRITE})
+		));
 	}
 }
 
@@ -183,28 +239,46 @@ void MallocUsableBefore(string* name, ADDRINT pointer, ADDRINT ret)
 void MallocUsableAfter(size_t size)
 {
 	// cout << "malloc usable: " << size << endl;
-	if (size == 0)
-		return;
-
+	if (size == 0) return;
+	pid_t tid = gettid();
+	
+	ADDRINT addr;
 	{
-		lock_guard<mutex> lk(gHeapMutex);
-		MapIter it = gHeapMap.find(gMallocUsableAddress);
-		if (it != gHeapMap.end()) {
-			// TraceFile << "Updating heap map @ " << gMallocUsableAddress << " from " << it->second->Size << " to " << size << endl;
-			it->second->Size = size;	
+		lock_guard<mutex> lk(gAllocMutex);
+		TAPIter it = gAllocParams.find(tid);
+		if (it == gAllocParams.end()) {
+			cerr << "[!] Could not find tid " << tid << " in MallocUsableAfter!" << endl;
+			return;
+		} else {
+			addr = it->second->usableAddr;
 		}
+	}
+	
+	lock_guard<mutex> lk(gHeapMutex);
+	MapIter it = gHeapMap.find(addr);
+	if (it != gHeapMap.end()) {
+		// TraceFile << "Updating heap map @ " << gMallocUsableAddress << " from " << it->second->Size << " to " << size << endl;
+		it->second->Size = size;
 	}
 }
 
 void AllocAfter(ADDRINT newalloc)
 {
-	if (!newalloc)
-		return;
-	ostringstream oss;
-	oss << hex << setfill('0');
-	oss << "Allocation @ 0x" << setw(8) << newalloc << ", size 0x" << gAllocSize << endl;
-	TraceFile << oss.str();
-	// cout << oss.str();
+	if (newalloc == 0) return;
+	pid_t tid = gettid();
+	ADDRINT size;
+	int prot;
+	{
+		lock_guard<mutex> lk(gAllocMutex);
+		TAPIter it = gAllocParams.find(gettid());
+		if (it == gAllocParams.end()) {
+			cerr << "[!] Could not find tid " << tid << " in AllocAfter!" << endl;
+			return;
+		} else {
+			size = it->second->size;
+			prot = it->second->prot;
+		}
+	}
 
 	{
 		lock_guard<mutex> lk(gHeapMutex);
@@ -212,10 +286,10 @@ void AllocAfter(ADDRINT newalloc)
 		if (it == gHeapMap.end()) {
 			// new allocation, track it
 			gHeapMap.insert(make_pair(newalloc,
-				RegionAttributesPtr(new RegionAttributes(gAllocSize, gAllocProt))));
+				RegionAttributesPtr(new RegionAttributes(size, prot))));
 		} else {
 			// allocation already exists, update size
-			it->second->Size = gAllocSize;
+			it->second->Size = size;
 		}
 	}
 
@@ -227,16 +301,16 @@ void AllocAfter(ADDRINT newalloc)
 			ADDRINT end = start + pAttr->Size;
 			if (newalloc >= start && newalloc <= end) {
 				// reusing a free chunk
-				if (newalloc == start && pAttr->Size == gAllocSize) {
+				if (newalloc == start && pAttr->Size == size) {
 					// full chunk reuse
 					gFreeMap.erase(it);
-				} else if (newalloc == start && gAllocSize < pAttr->Size) {
+				} else if (newalloc == start && size < pAttr->Size) {
 					// partial chunk reuse, case 1 (start of chunk)
 					gFreeMap.erase(it);
-					gFreeMap.insert(make_pair(newalloc + gAllocSize,
+					gFreeMap.insert(make_pair(newalloc + size,
 						RegionAttributesPtr(new RegionAttributes(
-							pAttr->Size - gAllocSize, pAttr->Prot))));
-				} else if (newalloc > start && gAllocSize < pAttr->Size) {
+							pAttr->Size - size, pAttr->Prot))));
+				} else if (newalloc > start && size < pAttr->Size) {
 					// partial chunk reuse, case 2 (middle of chunk)
 					ADDRINT oldChunk = it->first;
 					gFreeMap.erase(it);
@@ -245,9 +319,9 @@ void AllocAfter(ADDRINT newalloc)
 						RegionAttributesPtr(new RegionAttributes(
 							newalloc - start, pAttr->Prot))));
 					// sometimes have an after chunk
-					if (newalloc + gAllocSize < end) {
-						gFreeMap.insert(make_pair(newalloc + gAllocSize,
-							RegionAttributesPtr(new RegionAttributes(end - newalloc - gAllocSize, pAttr->Prot))));
+					if (newalloc + size < end) {
+						gFreeMap.insert(make_pair(newalloc + size,
+							RegionAttributesPtr(new RegionAttributes(end - newalloc - size, pAttr->Prot))));
 					}
 				} else if (newalloc == end) {
 					// shouldn't really happen, I don't think
@@ -256,6 +330,11 @@ void AllocAfter(ADDRINT newalloc)
 			}
 		}
 	}
+	ostringstream oss;
+	oss << hex << setfill('0');
+	oss << "Allocation @ 0x" << setw(8) << newalloc << ", size 0x" << size << ", thread 0x" << tid << endl;
+	TraceFile << oss.str();
+	cout << oss.str();
 }
 
 /* filter stack based read/write operations */
@@ -284,12 +363,8 @@ bool INS_has_tls(INS ins)
 void RtnInsertCall(IMG img, const string &funcname)
 {
 	RTN rtn = RTN_FindByName(img, funcname.c_str());
-
-	if (!RTN_Valid(rtn))
-		return;
-
+	if (!RTN_Valid(rtn)) return;
 	RTN_Open(rtn);
-	
 	string* pFuncName(new string(funcname));
 
 	/* On function call */
@@ -508,16 +583,40 @@ void stackptr_sub(ADDRINT address, ADDRINT sp, ADDRINT operand, string *mnemonic
 void TraceInstruction(INS ins, void *v)
 {
 	ADDRINT insaddr = INS_Address(ins);
+	ADDRINT ret, usableRet;
+	pid_t tid = gettid();
+	TAPIter it;
+	{
+		lock_guard<mutex> lk(gAllocMutex);
+		it = gAllocParams.find(tid);
+	}
+
+#if 0 // new thread detection? probably not needed...
+	static set<pid_t> gTids;
+	set<pid_t>::iterator setIter = gTids.find(tid);
+	if (setIter == gTids.end()) {
+		// cout << "New thread 0x" << hex << tid << " in trace" << endl;
+		gTids.insert(tid);
+	}
+#endif
+
+	if (it != gAllocParams.end()) {
+		ret = it->second->ret;
+		usableRet = it->second->ret;
+	} else {
+		// thread hasn't been instrumented yet, so there is nothing to check
+		return;
+	}
 
 	// instrument malloc calls
-	if (insaddr == gMallocRetAddr) {
+	if (insaddr == ret) {
 		INS_InsertCall(ins,
 			IPOINT_BEFORE,
 			(AFUNPTR)AllocAfter,
 			IARG_REG_VALUE, REG_GAX,
 			IARG_END
 		);
-	} else if (insaddr == gMallocUsableRet) {
+	} else if (insaddr == usableRet) {
 		INS_InsertCall(ins,
 			IPOINT_BEFORE,
 			(AFUNPTR)MallocUsableAfter,
